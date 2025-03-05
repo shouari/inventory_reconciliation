@@ -2,7 +2,8 @@ import streamlit as st
 import pandas as pd
 from Levenshtein import ratio
 import itertools
-
+import io
+from xlsxwriter import Workbook
 
 def normalize_sku(sku):
     """" Normalize SKU by removing spaces and converting to lowercase """
@@ -123,26 +124,24 @@ if qb_file and dt_file:
                 st.rerun()
 
 
-    # ------------------------- STEP 2: MATCH SKUs (Step-by-Step) -------------------------
+# ------------------------- STEP 2: MATCH SKUs (Step-by-Step) -------------------------
     if step == 2:
         st.header("🔍 Étape 2: Correspondance des SKUs")
 
         df_qb = st.session_state["qb_cleaned_data"]
         df_dt = st.session_state["dt_cleaned_data"]
 
-  # ---- Exact Matches ----
-        exact_matches = df_qb.drop_duplicates(subset="SKU")[df_qb["SKU"].isin(df_dt["SKU"])]
+        # ---- Exact Matches ----
+        exact_matches = df_qb[df_qb["SKU"].isin(df_dt["SKU"])].copy()
+        exact_matches["Match Type"] = "Exact"
         st.session_state["exact_matches"] = exact_matches
 
         with st.expander(f"✅ {len(exact_matches)} Correspondances Exactes (Afficher / Masquer)"):
             st.dataframe(exact_matches)
 
-        
-
-         # ---- Mismatches ----
-        mismatched_qb = df_qb.drop_duplicates(subset="SKU")[~df_qb["SKU"].isin(df_dt["SKU"])]
-        mismatched_dt = df_dt.drop_duplicates(subset="SKU")[~df_dt["SKU"].isin(df_qb["SKU"])]
-
+        # ---- Mismatches ----
+        mismatched_qb = df_qb[~df_qb["SKU"].isin(df_dt["SKU"])].copy()
+        mismatched_dt = df_dt[~df_dt["SKU"].isin(df_qb["SKU"])].copy()
         total_mismatches = len(mismatched_qb) + len(mismatched_dt)
 
         st.session_state["mismatched_qb"] = mismatched_qb
@@ -164,7 +163,7 @@ if qb_file and dt_file:
                 {"QuickBooks SKU": qb_sku, "D-Tools SKU": dt_sku, "Similitude": round(ratio(qb_sku, dt_sku) * 100, 2)}
                 for qb_sku in mismatched_qb["SKU"]
                 for dt_sku in mismatched_dt["SKU"]
-                if 80 < ratio(qb_sku, dt_sku) * 100 < 100 and qb_sku != dt_sku
+                if 90 < ratio(qb_sku, dt_sku) * 100 < 100 and qb_sku != dt_sku
             ]
             fuzzy_matches_df = pd.DataFrame(fuzzy_matches).sort_values(by="Similitude", ascending=False)
             st.session_state["fuzzy_queue"] = fuzzy_matches_df.to_dict(orient="records")
@@ -191,6 +190,7 @@ if qb_file and dt_file:
             if st.button("Suivant ➡️"):
                 if action == "🟡 Fusionner":
                     df_dt = df_dt[df_dt["SKU"] != fuzzy_match["D-Tools SKU"]]
+                    st.session_state["fuzzy_selected"] = st.session_state.get("fuzzy_selected", []) + [fuzzy_match]
                 elif action == "✅ Garder les deux":
                     pass  # Keep both
                 st.session_state["fuzzy_queue"].pop(0)
@@ -201,35 +201,98 @@ if qb_file and dt_file:
             st.session_state["step"] = 3
             st.rerun()
 
-    # ------------------------- STEP 3: FINALIZE & EXPORT -------------------------
+   # ------------------------- STEP 3: FINALIZE & EXPORT -------------------------
     if step == 3:
         st.header("📤 Étape 3: Finalisation & Export")
 
-        if st.button("🔙 Retour à l'etape 2"):
+        if st.button("🔙 Retour à l'étape 2"):
             st.session_state["step"] = 2
             st.rerun()
 
+        # ✅ Start with the D-Tools dataset to preserve template
+        df_output = st.session_state["dt_cleaned_data"].copy()
 
-        exact_match_csv = st.session_state["exact_matches"].to_csv(index=False).encode("utf-8")
-        fuzzy_match_csv = pd.DataFrame(st.session_state["fuzzy_queue"]).to_csv(index=False).encode("utf-8")
-        
+        # ✅ Identify QuickBooks "Quantité en stock" column dynamically
+        qb_qty_col = next((col for col in df_qb.columns if "quantité en stock" in col.lower()), None)
 
-
-        if "mismatched_qb" in st.session_state and "mismatched_dt" in st.session_state:
-            mismatch_qb_csv = st.session_state["mismatched_qb"].to_csv(index=False).encode("utf-8")
-            mismatch_dt_csv = st.session_state["mismatched_dt"].to_csv(index=False).encode("utf-8")
+        if qb_qty_col:
+            df_qb.rename(columns={qb_qty_col: "Quantity on Hand"}, inplace=True)
         else:
-            st.error("Les données des SKU non correspondants ne sont pas disponibles. Veuillez repasser par l'étape 2.")
-            st.stop()
+            st.warning("⚠️ 'Quantité en stock' column not found in QuickBooks data. Proceeding without it.")
 
+        # ✅ Merge QuickBooks Quantities into D-Tools Dataset
+        if "Quantity on Hand" in df_qb.columns:
+            df_output = df_output.merge(df_qb[["SKU", "Quantity on Hand"]], on="SKU", how="left", suffixes=("", "_QB"))
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.download_button("📥 Télécharger Correspondances Exactes", data=exact_match_csv, file_name="exact_matches.csv", mime="text/csv")
-            st.download_button("📥 Télécharger Fuzzy Matches", data=fuzzy_match_csv, file_name="fuzzy_matches.csv", mime="text/csv")
-        with col2:
-            st.download_button("📥 Télécharger QuickBooks Mismatches", data=mismatch_qb_csv, file_name="quickbooks_mismatches.csv", mime="text/csv")
-            st.download_button("📥 Télécharger D-Tools Mismatches", data=mismatch_dt_csv, file_name="dtools_mismatches.csv", mime="text/csv")
+            # ✅ Ensure "Quantity on Hand" is correctly assigned
+            df_output["Quantity on Hand"] = df_output["Quantity on Hand_QB"].combine_first(df_output["Quantity on Hand"])
+
+            # ✅ Remove the extra column
+            df_output.drop(columns=["Quantity on Hand_QB"], inplace=True)
+        
+        # ✅ Extract & Prepare Fuzzy Matches Data
+        df_fuzzy_selected = pd.DataFrame(st.session_state.get("fuzzy_selected", []))
+
+        if not df_fuzzy_selected.empty:
+            df_fuzzy_selected = df_fuzzy_selected.rename(columns={"QuickBooks SKU": "SKU"})  # Align SKU column
+            df_fuzzy_selected["Match Type"] = "Fuzzy Merged"
+
+        # ✅ Prepare Exact Matches Data
+        exact_matches = st.session_state.get("exact_matches", pd.DataFrame()).copy()
+        
+        if not exact_matches.empty:
+            exact_matches["Match Type"] = "Exact Match"
+            exact_matches = exact_matches.rename(columns={"QuickBooks SKU": "SKU"})  # Align SKU column
+
+        # ✅ Merge Exact Matches and Fuzzy Matches into the D-Tools Format
+        final_output = df_output.copy()
+       
+        for df_merge in [exact_matches, df_fuzzy_selected]:
+            if not df_merge.empty and "Quantity on Hand" in df_merge.columns:
+                final_output = final_output.merge(
+                    df_merge[["SKU", "Quantity on Hand"]], on="SKU", how="left", suffixes=("", "_Match")
+                )
+         # ✅ Ensure No Duplicate "Quantity on Hand" Columns
+        if "Quantity on Hand_QB" in final_output.columns and "Quantity on Hand_Match" in final_output.columns:
+            final_output["Quantity on Hand"] = final_output["Quantity on Hand_QB"].combine_first(final_output["Quantity on Hand_Match"])
+            final_output.drop(columns=["Quantity on Hand_QB", "Quantity on Hand_Match"], inplace=True)
+        elif "Quantity on Hand_QB" in final_output.columns:
+            final_output.rename(columns={"Quantity on Hand_QB": "Quantity on Hand"}, inplace=True)
+        elif "Quantity on Hand_Match" in final_output.columns:
+            final_output.rename(columns={"Quantity on Hand_Match": "Quantity on Hand"}, inplace=True)
+   
+        
+        # ✅ Ensure All Expected D-Tools Columns Exist
+        expected_columns = list(df_output.columns)
+
+        # Add missing columns without overwriting existing data
+        for col in expected_columns:
+            if col not in final_output.columns:
+                final_output[col] = ""
+
+        # ✅ Align Final Output to D-Tools Column Order
+        final_output = final_output[expected_columns]
+
+        # ✅ Remove Any Unnecessary Columns (Like Unnamed)
+        final_output = final_output.loc[:, ~final_output.columns.str.contains("^Unnamed")]
+       
+        st.write(final_output)
+       
+       
+        # ✅ Export to Excel in Memory
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            final_output.to_excel(writer, sheet_name="Final Inventory", index=False)
+
+        excel_data = output.getvalue()
+
+        # ✅ Single Download Button for Cleaned Excel File
+        st.download_button(
+            label="📥 Télécharger Inventaire Final (Excel)",
+            data=excel_data,
+            file_name="Inventaire_Final.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
         if st.button("🔙 Retour au début"):
             st.session_state["step"] = 1
