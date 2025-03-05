@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 from Levenshtein import ratio
-import hashlib
 import itertools
 
 
