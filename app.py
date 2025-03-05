@@ -1,193 +1,293 @@
 import streamlit as st
 import pandas as pd
 from Levenshtein import ratio
-import numpy as np
-
-st.set_page_config(page_title="📦 Outil de Réconciliation des Stocks", page_icon=":package:", layout="wide")
+import hashlib
 
 
+def normalize_sku(sku):
+    """" Normalize SKU by removing spaces and converting to lowercase """
+    return ''.join(filter(str.isalnum, sku.upper()))
 
-# Step 1: File Upload
+st.set_page_config(layout="wide")
+
+st.title("📦 Outil de Réconciliation des Stocks ")
+
+
+# ---- File Upload ----
 st.sidebar.header("Étape 1: Importer les fichiers")
-qb_file = st.sidebar.file_uploader("📘 Importer l'inventaire QuickBooks", type=["csv", "xlsx"])
-dt_file = st.sidebar.file_uploader("📗 Importer l'inventaire D-Tools", type=["csv", "xlsx"])
+qb_file = st.sidebar.file_uploader("📘 Inventaire QuickBooks", type=["csv", "xlsx"])
+dt_file = st.sidebar.file_uploader("📗 Inventaire D-Tools", type=["csv", "xlsx"])
 
 if qb_file and dt_file:
-    # Load Data (Ensure SKU is string to avoid ArrowTypeError)
+    # Load Data (Ensure SKU is string)
     df_qb = pd.read_csv(qb_file, sep=";", dtype=str) if qb_file.name.endswith('.csv') else pd.read_excel(qb_file, dtype=str)
     df_dt = pd.read_csv(dt_file, sep=";", dtype=str) if dt_file.name.endswith('.csv') else pd.read_excel(dt_file, dtype=str)
 
     # Normalize SKUs
-    df_qb["SKU"] = df_qb["SKU"].astype(str).str.strip().str.upper()
-    df_dt["SKU"] = df_dt["SKU"].astype(str).str.strip().str.upper()
+    df_qb["SKU_NORM"] = df_qb["SKU"].astype(str).str.strip().str.upper().apply(normalize_sku)
+    df_dt["SKU_NORM"] = df_dt["SKU"]. astype(str).str.strip().str.upper().apply(normalize_sku)
 
-    # Sidebar Navigation
+    # Step Navigation
     if "step" not in st.session_state:
-        st.session_state["step"] = 1
-
+        st.session_state["step"] = 1 
     step = st.session_state["step"]
 
-# Function for pagination
-def paginate_dataframe(df, page_size=100):
-    total_pages = np.ceil(len(df) / page_size).astype(int)
-    page_number = st.session_state.get("page_number", 1)
-
-    if page_number > total_pages:
-        page_number = 1  # Reset if out of range
-
-    start_idx = (page_number - 1) * page_size
-    end_idx = start_idx + page_size
-    df_page = df.iloc[start_idx:end_idx]
-
-    # Pagination controls
-    col1, col2, col3 = st.columns([1, 4, 1])
-    if col1.button("⬅️ Précédent") and page_number > 1:
-        st.session_state["page_number"] = page_number - 1
-        st.rerun()
-
-    col3.write(f"📄 Page {page_number} / {total_pages}")
-
-    if col3.button("➡️ Suivant") and page_number < total_pages:
-        st.session_state["page_number"] = page_number + 1
-        st.rerun()
-
-    return df_page
-
     # ------------------------- STEP 1: CLEAN INDIVIDUAL FILES -------------------------
-if step == 1:
-    st.header("🔍 Étape 1: Nettoyage des fichiers individuels")
+    if step == 1:
+        st.header("🔍 Étape 1: Nettoyage des fichiers individuels")
 
-    col1, col2 = st.columns(2)
+        # ✅ Detect Exact Duplicates
+        duplicate_counts_qb = df_qb["SKU_NORM"].value_counts()
+        duplicate_skus_qb = duplicate_counts_qb[duplicate_counts_qb > 1].index.tolist()
 
-    def process_duplicates(df, source_name):
-        """Find duplicates within the same file and allow bulk resolution via table."""
-        st.subheader(f"🛠️ Gestion des doublons - {source_name}")
-        dupes = df[df.duplicated(subset=['SKU'], keep=False)].copy()
+        duplicate_counts_dt = df_dt["SKU_NORM"].value_counts()
+        duplicate_skus_dt = duplicate_counts_dt[duplicate_counts_dt > 1].index.tolist()
 
-        if not dupes.empty:
-            st.write(f"⚠️ {len(dupes)} doublons détectés.")
+        # ✅ Save Exact Duplicates in Session State
+        if "qb_duplicate_queue" not in st.session_state:
+            st.session_state["qb_duplicate_queue"] = duplicate_skus_qb
+            st.session_state["qb_cleaned_data"] = df_qb.copy()
 
-            # Add selection column
-            dupes["Sélectionner"] = False
+        if "dt_duplicate_queue" not in st.session_state:
+            st.session_state["dt_duplicate_queue"] = duplicate_skus_dt
+            st.session_state["dt_cleaned_data"] = df_dt.copy()
 
-            # Paginate table
-            dupes_page = paginate_dataframe(dupes)
+        # ✅ Detect Fuzzy Duplicates (85%+ Similarity)
+        fuzzy_qb_duplicates = []
+        fuzzy_dt_duplicates = []
 
-            # Display paginated table with checkboxes
-            edited_df = st.data_editor(dupes_page, column_config={"Sélectionner": st.column_config.CheckboxColumn()}, hide_index=True)
+        for sku1 in df_qb["SKU_NORM"].unique():
+            for sku2 in df_qb["SKU_NORM"].unique():
+                if sku1 != sku2 and ratio(sku1, sku2) > 0.95:
+                    fuzzy_qb_duplicates.append((sku1, sku2))
 
-            # Bulk actions
-            col1, col2 = st.columns(2)
-            if col1.button("🟡 Fusionner les sélectionnés"):
-                selected_skus = edited_df[edited_df["Sélectionner"] == True]["SKU"].unique()
-                df = df[~df["SKU"].isin(selected_skus)]  # Remove duplicates
-                df = pd.concat([df, dupes[dupes["SKU"].isin(selected_skus)].drop(columns=["Sélectionner"])], ignore_index=True)
-                st.success(f"✅ {len(selected_skus)} SKUs fusionnés !")
+        for sku1 in df_dt["SKU_NORM"].unique():
+            for sku2 in df_dt["SKU_NORM"].unique():
+                if sku1 != sku2 and ratio(sku1, sku2) > 0.95:
+                    fuzzy_dt_duplicates.append((sku1, sku2))
+
+        # ✅ Store Fuzzy Duplicates
+        if "qb_fuzzy_duplicates" not in st.session_state:
+            st.session_state["qb_fuzzy_duplicates"] = fuzzy_qb_duplicates
+        if "dt_fuzzy_duplicates" not in st.session_state:
+            st.session_state["dt_fuzzy_duplicates"] = fuzzy_dt_duplicates
+
+        # ✅ Display Duplicate Counts
+        total_duplicates_qb = len(st.session_state["qb_duplicate_queue"])
+        total_duplicates_dt = len(st.session_state["dt_duplicate_queue"])
+        total_fuzzy_qb = len(st.session_state["qb_fuzzy_duplicates"])
+        total_fuzzy_dt = len(st.session_state["dt_fuzzy_duplicates"])
+
+        st.subheader(f"📊 Nombre total de doublons détectés:")
+        st.write(f"📘 QuickBooks: {total_duplicates_qb} exacts, {total_fuzzy_qb} approximatifs")
+        st.write(f"📗 D-Tools: {total_duplicates_dt} exacts, {total_fuzzy_dt} approximatifs")
+
+        if st.button("⏭️ Ignorer le nettoyage et passer à l'étape 2"):
+            st.session_state["step"] = 2
+            st.rerun()
+
+        # ✅ Process Exact Duplicates First QB
+        if len(st.session_state["qb_duplicate_queue"]) > 0:
+            current_sku = st.session_state["qb_duplicate_queue"][0]
+            df_duplicate_group_qb = st.session_state["qb_cleaned_data"][st.session_state["qb_cleaned_data"]["SKU_NORM"] == current_sku]
+
+            st.subheader(f"🛠️ Gestion des doublons (QuickBooks) - SKU: `{current_sku}`")
+            st.dataframe(df_duplicate_group_qb)
+
+            action = st.radio("Choisissez une action:", ["✅ Garder", "🟡 Fusionner", "🔴 Supprimer"], key="qb_action_choice")
+
+            if st.button("Suivant ➡️", key="qb_next"):
+                if action == "🟡 Fusionner":
+                    st.session_state["qb_cleaned_data"] = st.session_state["qb_cleaned_data"][st.session_state["qb_cleaned_data"]["SKU_NORM"] != current_sku]
+                elif action == "🔴 Supprimer":
+                    st.session_state["qb_cleaned_data"] = st.session_state["qb_cleaned_data"][st.session_state["qb_cleaned_data"]["SKU_NORM"] != current_sku]
+                st.session_state["qb_duplicate_queue"].pop(0)
                 st.rerun()
 
-            if col2.button("🔴 Supprimer les sélectionnés"):
-                selected_skus = edited_df[edited_df["Sélectionner"] == True]["SKU"].unique()
-                df = df[~df["SKU"].isin(selected_skus)]
-                st.success(f"✅ {len(selected_skus)} SKUs supprimés !")
+        # ✅ Process Fuzzy Duplicates QB
+        elif len(st.session_state["qb_fuzzy_duplicates"]) > 0:
+            fuzzy_sku1, fuzzy_sku2 = st.session_state["qb_fuzzy_duplicates"][0]
+
+            st.subheader(f"🔍 Correspondance Approximative (QuickBooks)")
+            st.write(f"❓ Confirmer `{fuzzy_sku1}` ≈ `{fuzzy_sku2}` comme duplicatas?")
+            confirm = st.radio(f"Fusionner `{fuzzy_sku1}` et `{fuzzy_sku2}` ?", ["❌ Non", "✅ Oui"], key=f"qb_fuzzy_{fuzzy_sku1}_{fuzzy_sku2}")
+
+            if st.button("Suivant ➡️", key=f"qb_fuzzy_next_{fuzzy_sku1}"):
+                if confirm == "✅ Oui":
+                    st.session_state["qb_cleaned_data"] = st.session_state["qb_cleaned_data"][st.session_state["qb_cleaned_data"]["SKU_NORM"] != fuzzy_sku2]
+                st.session_state["qb_fuzzy_duplicates"].pop(0)
                 st.rerun()
 
-            return df
+        #     # ✅ Process Exact Duplicates First DT
+        # if len(st.session_state["dt_duplicate_queue"]) > 0:
+        #     current_sku = st.session_state["dt_duplicate_queue"][0]
+        #     df_duplicate_group_dt = st.session_state["dt_cleaned_data"][st.session_state["dt_cleaned_data"]["SKU_NORM"] == current_sku]
+
+        #     st.subheader(f"🛠️ Gestion des doublons (D-Tools) - SKU: `{current_sku}`")
+        #     st.dataframe(df_duplicate_group_dt)
+
+        #     action = st.radio("Choisissez une action:", ["✅ Garder", "🟡 Fusionner", "🔴 Supprimer"], key="dt_action_choice")
+
+        #     if st.button("Suivant ➡️", key="dt_next"):
+        #         if action == "🟡 Fusionner":
+        #             st.session_state["dt_cleaned_data"] = st.session_state["dt_cleaned_data"][st.session_state["dt_cleaned_data"]["SKU_NORM"] != current_sku]
+        #         elif action == "🔴 Supprimer":
+        #             st.session_state["dt_cleaned_data"] = st.session_state["dt_cleaned_data"][st.session_state["dt_cleaned_data"]["SKU_NORM"] != current_sku]
+        #         st.session_state["dt_duplicate_queue"].pop(0)
+        #         st.rerun()
+
+        # # ✅ Process Fuzzy Duplicates DT
+        # elif len(st.session_state["dt_fuzzy_duplicates"]) > 0:
+        #     fuzzy_sku1, fuzzy_sku2 = st.session_state["dt_fuzzy_duplicates"][0]
+
+        #     st.subheader(f"🔍 Correspondance Approximative (QuickBooks)")
+        #     st.write(f"❓ Confirmer `{fuzzy_sku1}` ≈ `{fuzzy_sku2}` comme duplicatas?")
+        #     confirm = st.radio(f"Fusionner `{fuzzy_sku1}` et `{fuzzy_sku2}` ?", ["❌ Non", "✅ Oui"], key=f"qb_fuzzy_{fuzzy_sku1}_{fuzzy_sku2}")
+
+        #     if st.button("Suivant ➡️", key=f"dt_fuzzy_next_{fuzzy_sku1}"):
+        #         if confirm == "✅ Oui":
+        #             st.session_state["dt_cleaned_data"] = st.session_state["dt_cleaned_data"][st.session_state["dt_cleaned_data"]["SKU_NORM"] != fuzzy_sku2]
+        #         st.session_state["dt_fuzzy_duplicates"].pop(0)
+        #         st.rerun()
+
+        # Once both QuickBooks & D-Tools duplicates are done, allow download
         else:
-            st.success(f"Aucun doublon trouvé dans {source_name}.")
-            return df
+            st.success("✅ Tous les doublons ont été traités pour QuickBooks et D-Tools !")
 
-    # Process duplicates for both QuickBooks & D-Tools
-    with col1:
-        st.markdown("### 📘 Inventaire QuickBooks")
-        st.metric("📦 Total Articles", len(df_qb))
-        df_qb = process_duplicates(df_qb, "QuickBooks")
+            df_final_qb = st.session_state["qb_cleaned_data"]
+            df_final_dt = st.session_state["dt_cleaned_data"]
 
-    with col2:
-        st.markdown("### 📗 Inventaire D-Tools")
-        st.metric("📦 Total Articles", len(df_dt))
-        df_dt = process_duplicates(df_dt, "D-Tools")
+            cleaned_csv_qb = df_final_qb.to_csv(index=False).encode("utf-8")
+            cleaned_csv_dt = df_final_dt.to_csv(index=False).encode("utf-8")
 
-    # Move to next step
-    if st.button("🔜 Passer à l'étape 2"):
-        st.session_state["df_qb_cleaned"] = df_qb
-        st.session_state["df_dt_cleaned"] = df_dt
-        st.session_state["step"] = 2
-        st.rerun()
+            col1, col2 = st.columns(2)
+            with col1:
+                st.download_button(
+                    label="📥 Télécharger Inventaire QuickBooks",
+                    data=cleaned_csv_qb,
+                    file_name="quickbooks_nettoye.csv",
+                    mime="text/csv"
+                )
+            with col2:
+                st.download_button(
+                    label="📥 Télécharger Inventaire D-Tools",
+                    data=cleaned_csv_dt,
+                    file_name="dtools_nettoye.csv",
+                    mime="text/csv"
+                )
 
-
-    # ------------------------- STEP 2: MATCH SKUs -------------------------
-    if step == 2:
-        st.header("🔍 Étape 2: Correspondance des SKUs entre QuickBooks & D-Tools")
-
-        df_qb = st.session_state.get("df_qb_cleaned", pd.DataFrame())
-        df_dt = st.session_state.get("df_dt_cleaned", pd.DataFrame())
-
-        if not df_qb.empty and not df_dt.empty:
-            # --- Handle Unmatched SKUs ---
-            st.subheader("❌ SKUs Sans Correspondance")
-            non_matching_qb = df_qb[~df_qb["SKU"].isin(df_dt["SKU"])]
-            non_matching_dt = df_dt[~df_dt["SKU"].isin(df_qb["SKU"])]
-
-            if not non_matching_qb.empty:
-                non_matching_qb["Sélectionner"] = False
-                st.write("📘 SKUs dans QuickBooks mais absents de D-Tools")
-                edited_qb = st.data_editor(non_matching_qb, column_config={"Sélectionner": st.column_config.CheckboxColumn()}, hide_index=True)
-
-                if st.button("🟡 Garder sélectionnés dans QuickBooks"):
-                    selected_skus = edited_qb[edited_qb["Sélectionner"] == True]["SKU"].unique()
-                    df_qb = df_qb[df_qb["SKU"].isin(selected_skus)]
-                    st.success(f"✅ {len(selected_skus)} SKUs conservés.")
-                    st.rerun()
-
-            if not non_matching_dt.empty:
-                non_matching_dt["Sélectionner"] = False
-                st.write("📗 SKUs dans D-Tools mais absents de QuickBooks")
-                edited_dt = st.data_editor(non_matching_dt, column_config={"Sélectionner": st.column_config.CheckboxColumn()}, hide_index=True)
-
-                if st.button("🟡 Garder sélectionnés dans D-Tools"):
-                    selected_skus = edited_dt[edited_dt["Sélectionner"] == True]["SKU"].unique()
-                    df_dt = df_dt[df_dt["SKU"].isin(selected_skus)]
-                    st.success(f"✅ {len(selected_skus)} SKUs conservés.")
-                    st.rerun()
-
-            # --- Fuzzy Matching with Bulk Confirmation ---
-            st.subheader("⚠️ Correspondances Approximatives (Fuzzy Matching)")
-            fuzzy_matches = get_fuzzy_matches(df_qb["SKU"].unique(), df_dt["SKU"].unique())
-
-            if not fuzzy_matches.empty:
-                fuzzy_matches["Sélectionner"] = False
-                st.data_editor(fuzzy_matches, column_config={"Sélectionner": st.column_config.CheckboxColumn()}, hide_index=True)
-
-                if st.button("🟢 Confirmer les correspondances sélectionnées"):
-                    selected_matches = fuzzy_matches[fuzzy_matches["Sélectionner"] == True]
-                    for _, row in selected_matches.iterrows():
-                        df_qb = df_qb[df_qb["SKU"] != row["SKU QuickBooks"]]
-                        df_dt = df_dt[df_dt["SKU"] != row["SKU D-Tools"]]
-                    st.success(f"✅ {len(selected_matches)} correspondances confirmées.")
-                    st.rerun()
-
-            if st.button("🔜 Passer à l'étape 3"):
-                st.session_state["df_final"] = pd.concat([df_qb, df_dt], ignore_index=True)
-                st.session_state["step"] = 3
+            if st.button("🔜 Passer à l'étape 2"):
+                st.session_state["step"] = 2
                 st.rerun()
 
+
+    # ------------------------- STEP 2: MATCH SKUs (Step-by-Step) -------------------------
+    if step == 2:
+        st.header("🔍 Étape 2: Correspondance des SKUs")
+
+        df_qb = st.session_state["qb_cleaned_data"]
+        df_dt = st.session_state["dt_cleaned_data"]
+
+  # ---- Exact Matches ----
+        exact_matches = df_qb.drop_duplicates(subset="SKU")[df_qb["SKU"].isin(df_dt["SKU"])]
+        st.session_state["exact_matches"] = exact_matches
+
+        with st.expander(f"✅ {len(exact_matches)} Correspondances Exactes (Afficher / Masquer)"):
+            st.dataframe(exact_matches)
+
+        
+
+         # ---- Mismatches ----
+        mismatched_qb = df_qb.drop_duplicates(subset="SKU")[~df_qb["SKU"].isin(df_dt["SKU"])]
+        mismatched_dt = df_dt.drop_duplicates(subset="SKU")[~df_dt["SKU"].isin(df_qb["SKU"])]
+
+        total_mismatches = len(mismatched_qb) + len(mismatched_dt)
+
+        st.session_state["mismatched_qb"] = mismatched_qb
+        st.session_state["mismatched_dt"] = mismatched_dt
+
+        st.subheader(f"🔍 Nombre total de SKU non correspondants : {total_mismatches}")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write(f"📘 QuickBooks SKUs non trouvés dans D-Tools: {len(mismatched_qb)}")
+            st.dataframe(mismatched_qb)
+        with col2:
+            st.write(f"📗 D-Tools SKUs non trouvés dans QuickBooks: {len(mismatched_dt)}")
+            st.dataframe(mismatched_dt)
+
+        # ---- Fuzzy Matches ----
+        if "fuzzy_queue" not in st.session_state or not st.session_state["fuzzy_queue"]:
+            fuzzy_matches = [
+                {"QuickBooks SKU": qb_sku, "D-Tools SKU": dt_sku, "Similitude": round(ratio(qb_sku, dt_sku) * 100, 2)}
+                for qb_sku in mismatched_qb["SKU"]
+                for dt_sku in mismatched_dt["SKU"]
+                if 80 < ratio(qb_sku, dt_sku) * 100 < 100 and qb_sku != dt_sku
+            ]
+            fuzzy_matches_df = pd.DataFrame(fuzzy_matches).sort_values(by="Similitude", ascending=False)
+            st.session_state["fuzzy_queue"] = fuzzy_matches_df.to_dict(orient="records")
+
+        st.subheader(f"⚠️ {len(st.session_state['fuzzy_queue'])} Correspondances Approximatives")
+
+        if len(st.session_state["fuzzy_queue"]) > 0:
+            fuzzy_match = st.session_state["fuzzy_queue"][0]
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.write("📘 **QuickBooks SKU**")
+                st.write(f"🔵 `{fuzzy_match['QuickBooks SKU']}`")
+            with col2:
+                st.write("📗 **D-Tools SKU**")
+                st.write(f"🟢 `{fuzzy_match['D-Tools SKU']}`")
+            with col3:
+                st.write("📊 **Similitude**")
+                similarity = fuzzy_match['Similitude']
+                color = f"background-color: rgba({255 - int(similarity * 2.55)}, {int(similarity * 2.55)}, 0, 0.5); padding:5px; border-radius:8px;"
+                st.markdown(f"<div style='{color}'>{similarity:.0f}%</div>", unsafe_allow_html=True)
+
+            action = st.radio("Choisissez une action:", ["✅ Garder les deux", "🟡 Fusionner", "🔴 Ignorer"], key="fuzzy_action")
+
+            if st.button("Suivant ➡️"):
+                if action == "🟡 Fusionner":
+                    df_dt = df_dt[df_dt["SKU"] != fuzzy_match["D-Tools SKU"]]
+                elif action == "✅ Garder les deux":
+                    pass  # Keep both
+                st.session_state["fuzzy_queue"].pop(0)
+                st.session_state["dt_cleaned_data"] = df_dt
+                st.rerun()
+            
+        if st.button("🔜 Passer à l'étape 3", key="step_3"):
+            st.session_state["step"] = 3
+            st.rerun()
 
     # ------------------------- STEP 3: FINALIZE & EXPORT -------------------------
     if step == 3:
         st.header("📤 Étape 3: Finalisation & Export")
 
-        df_final = st.session_state.get("df_final", pd.DataFrame())
+        if st.button("🔙 Retour à l'etape 2"):
+            st.session_state["step"] = 2
+            st.rerun()
 
-        if not df_final.empty:
-            st.subheader("📜 Inventaire final réconcilié")
-            st.dataframe(df_final)
 
-            st.download_button(
-                label="📥 Télécharger l'inventaire nettoyé",
-                data=df_final.to_csv(index=False).encode("utf-8"),
-                file_name="inventaire_nettoye.csv",
-                mime="text/csv"
-            )
+        exact_match_csv = st.session_state["exact_matches"].to_csv(index=False).encode("utf-8")
+        fuzzy_match_csv = pd.DataFrame(st.session_state["fuzzy_queue"]).to_csv(index=False).encode("utf-8")
+        
+
+
+        if "mismatched_qb" in st.session_state and "mismatched_dt" in st.session_state:
+            mismatch_qb_csv = st.session_state["mismatched_qb"].to_csv(index=False).encode("utf-8")
+            mismatch_dt_csv = st.session_state["mismatched_dt"].to_csv(index=False).encode("utf-8")
+        else:
+            st.error("Les données des SKU non correspondants ne sont pas disponibles. Veuillez repasser par l'étape 2.")
+            st.stop()
+
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button("📥 Télécharger Correspondances Exactes", data=exact_match_csv, file_name="exact_matches.csv", mime="text/csv")
+            st.download_button("📥 Télécharger Fuzzy Matches", data=fuzzy_match_csv, file_name="fuzzy_matches.csv", mime="text/csv")
+        with col2:
+            st.download_button("📥 Télécharger QuickBooks Mismatches", data=mismatch_qb_csv, file_name="quickbooks_mismatches.csv", mime="text/csv")
+            st.download_button("📥 Télécharger D-Tools Mismatches", data=mismatch_dt_csv, file_name="dtools_mismatches.csv", mime="text/csv")
 
         if st.button("🔙 Retour au début"):
             st.session_state["step"] = 1
